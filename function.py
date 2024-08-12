@@ -1,157 +1,322 @@
 import numpy as np
 import networkx as nx
-from scipy.optimize import minimize
+import pandas as pd
 from scipy.optimize import linprog
-import random
-from itertools import combinations
 import math
+from math import comb
+import random
+import itertools
+from itertools import combinations, combinations_with_replacement
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import torch_geometric.transforms as T
 
 
-# V denotes set of nodes of the form [0,1,....,N]
-# n_classes: number of communities
-# n_unit: for example, n_unit = [60,40,20] implies there are 3 communities, 
-# and number of nodes in each community is [60,40,20]
-# p: homo connection probability in the planted partition model
-# q: hetoro connection probability in the planted partition model
-def Generating_graph_with_simplices(V, n_classes, n_unit, p, q):
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+
+def generating_graph_with_simplices(n_units, prob_mat2):
+    # n_units: node distribution over clusters
+    # prob_mat2: B_2 in the manuscript
     
-    def connection_function(p, q, x, y, subsets):
-        same_subset = False
-        for subset in subsets:
-            if x in subset and y in subset:
-                same_subset = True
-                break
-
-        if same_subset:
-            return 1 if random.random() < p else 0
-        else:
-            return 1 if random.random() < q else 0    
-
+    # Create nodes
+    V = [i for i in range(sum(n_units))]
+    
+    def connection_function(x, y, classes, prob_mat):
+        # Find the classes to which x and y belong
+        for i in range(len(classes)):
+            if x in classes[i]:
+                class_x = i
+            if y in classes[i]:
+                class_y = i
+                
+        # Check the connection probability between the classes in prob_mat
+        return 1 if random.random() < prob_mat[class_x][class_y] else 0
+    
     n_V = len(V)
     possible_edges = list(combinations(V, 2))
 
-    interval = np.cumsum(np.insert(n_unit,0,0))
-    Classes = [np.arange(n_V)[interval[i]:interval[i+1]] for i in range(len(n_unit))]
-    subsets = [set(Classes[i]) for i in range(n_classes)]
-
-    # For the possible_edges, the connected and unconnected ones are mapped to 1 and 0, respectively.
-    connect = [ connection_function(p, q, possible_edges[i][0], possible_edges[i][1], subsets) 
-               for i in range(len(possible_edges)) ]  
-    real_edges = [ possible_edges[i] for i in range(len(possible_edges)) if connect[i] == 1]
-    G = nx.Graph()
-    G.add_nodes_from(V)       
-    G.add_edges_from(real_edges)  
+    # Generate indices for each class
+    interval = np.cumsum(np.insert(n_units, 0, 0))
+    classes = [set(np.arange(n_V)[interval[i]:interval[i+1]]) for i in range(len(n_units))]
     
-    # Simplices
+    # Determine connections
+    connect = [connection_function(possible_edges[i][0], possible_edges[i][1], classes, prob_mat2)
+               for i in range(len(possible_edges))]
+    
+    real_edges = [possible_edges[i] for i in range(len(possible_edges)) if connect[i] == 1]
+    
+    # Create the graph
+    G = nx.Graph()
+    G.add_nodes_from(V)
+    G.add_edges_from(real_edges)
+
+    # Ensure graph connectivity
+    if not nx.is_connected(G):
+        connected_components = list(nx.connected_components(G))
+        # Connect unconnected components to a random node
+        for component in connected_components[1:]:
+            random_class = random.choice(list(classes))
+            connect_node = np.random.choice(list(random_class))
+            G.add_edge(connect_node, list(component)[0])
+    
+    # Assign labels and add node attributes
+    label = {}
+    for idx, class_set in enumerate(classes):
+        for node in class_set:
+            label[node] = idx
+    nx.set_node_attributes(G, label, 'label')
+    
+    # Generate simplices
     all_cliques = list(nx.enumerate_all_cliques(G))
-    Simplices = [ [] for i in range(len(all_cliques[-1])) ]
+    simplices = [[] for _ in range(len(all_cliques[-1]))]
+    for clique in all_cliques:
+        n = len(clique)
+        simplices[n-1].append(clique)
+    
+    return G, simplices, classes, list(label.values())
+
+
+
+
+# Generates k-cliques based on the probabilities assigned to each cluster in the probability matrix (prob_mat).
+# After generating the cliques, they should be added to the original graph G.
+def k_cliques_generation(N, k, prob_mat):
+    # N = [N_1, N_2, ..., N_n_L], number of nodes for each cluster.
+    # k: k-clique.
+    # prob_mat: n_L x n_L matrix, its i, j component implies the connection probability of nodes between cluster i and j
+    
+
+    # For a given node distribution, calculate 1. number of nodes for each cluster, 2. the expected number of k-cliques in this case.
+    def n_expected_cliques(N, clique_node_dist, prob_mat):
+    
+        # Count the number of nodes in each cluster
+        dist_counts = [clique_node_dist.count(i) for i in range(len(N))]
+        # Calculate combinations
+        # The dtype is specified to avoid errors in np.prod when handling large integers
+        combinations = np.prod([comb(N[i], dist_counts[i]) for i in range(len(N)) if dist_counts[i] > 0], dtype=np.float64)
+        # Calculate the connection probability between nodes within the same cluster
+        internal_edges = sum(comb(count, 2) for count in dist_counts if count > 1)
+        internal_prob = np.prod([prob_mat[i, i]**comb(dist_counts[i], 2) for i in range(len(N)) if dist_counts[i] > 1])
+    
+        # Calculate the connection probability between nodes in different clusters
+        external_prob = 1
+        for i in range(len(N)):
+            for j in range(i + 1, len(N)):  # Ensure i < j to exclude cases where i and j are the same
+                if dist_counts[i] > 0 and dist_counts[j] > 0:
+                    external_prob *= prob_mat[i, j]**(dist_counts[i] * dist_counts[j])
+    
+        # Calculate the final probability
+        n_cliques = int(combinations * internal_prob * external_prob)
+        return dist_counts, n_cliques
+
+    # Using the number of nodes for each cluster and the expected number of k-cliques, generate k-cliques.
+    def generate_unique_cliques(N, dist_counts, n_cliques):
+        total_nodes = sum(N)
+        node_pools = []
+        current_index = 0
+    
+        # Create a pool of nodes for each cluster
+        for count in N:
+            node_pools.append(list(range(current_index, current_index + count)))
+            current_index += count
+    
+        # Generate all possible cliques
+        all_cliques = set()
+        
+        while len(all_cliques) < n_cliques:
+            clique = []
+            for i, count in enumerate(dist_counts):
+                if count > 0:
+                    clique.extend(random.sample(node_pools[i], count))
+            all_cliques.add(tuple(sorted(clique)))  # Sort cliques to avoid duplicates
+            
+        return list(all_cliques)
+
+    n_L = len(N)  # Number of labels or clusters
+    comb_with_rep = list(combinations_with_replacement(range(n_L), k))  # Generate all possible combinations
+    n_combs = len(comb_with_rep)  # nHr, n = n_L, r = k    
+    
+    # Generate k-cliques for all possible cases
+    total_cliques = []
+    for i in range(n_combs):
+        clique_distribution, n_cliques = n_expected_cliques(N, comb_with_rep[i], prob_mat)
+        total_cliques.append(generate_unique_cliques(N, clique_distribution, n_cliques))
+    total_cliques = sum(total_cliques, [])
+
+    return total_cliques
+
+
+
+
+# Converts the generated higher-dimensional structures (cliques) into edges to add them to the graph.
+def to_edges(cliques):
+    result_list = []
+    for clique in cliques:
+        combinations = list(itertools.combinations(clique, 2))
+
+
+
+
+# Generate edges up to 5-cliques
+def generation_upto_5cliques(prob_mat2, prob_mat3, prob_mat4, prob_mat5, n_units):
+
+    # prob_mat2, 3, 4, and 5 correspond to B_2, 3, 4, and 5 in the manuscript
+    # n_units: node distribution over clusters
+    
+    V = [i for i in range(sum(n_units))]
+    n_L = len(n_units)
+
+    G, simplices, classes, labels = generating_graph_with_simplices(n_units, prob_mat2)
+    
+    clique_size = 3
+    three_cliques = k_cliques_generation(n_units, clique_size, prob_mat3)
+    G.add_edges_from(to_edges(three_cliques))
+    
+    clique_size = 4
+    four_cliques = k_cliques_generation(n_units, clique_size, prob_mat4)
+    G.add_edges_from(to_edges(four_cliques))
+    
+    clique_size = 5
+    five_cliques = k_cliques_generation(n_units, clique_size, prob_mat5)
+    G.add_edges_from(to_edges(five_cliques))
+    
+    all_cliques = list(nx.enumerate_all_cliques(G))
+    simplices = [[] for i in range(len(all_cliques[-1]))]
     for i in range(len(all_cliques)):
         n = len(all_cliques[i])
-        Simplices[n-1].append(all_cliques[i])
-    Label = []
-    for i in range(n_classes):
-        Label = Label + [i for k in range(n_unit[i])]
-    Label_mat = np.concatenate([np.stack([np.eye(n_classes)[i] for j in range(n_unit[i])]) 
-                                for i in range(n_classes)]) 
-    
-    return G, Simplices, Classes, Label, Label_mat   
+        simplices[n-1].append(all_cliques[i])
 
-def Adjacency_matrix(G):
+    return G, simplices, classes, labels
+
+
+# adjacency_matrix for the network.
+def adjacency_matrix(G):
+    return nx.adjacency_matrix(G).toarray()
+
+
+# Solves a linear programming problem using the given matrix A and returns the result.
+def linear_programming(A, method='highs'):
+   
+    # A : numpy.ndarray, submatrix of matrix L with dimensions F x F.
+    # method : The method used to solve the linear programming problem. The default is 'highs'.
+    # Returns: numpy.ndarray, The solution vector X resulting from the linear programming problem.
+
+
+    n = A.shape[0]  # Size n of matrix A
+
+    # Objective function: minimize the last variable a
+    c = np.zeros(n+1)
+    c[-1] = 1
+
+    # Inequality constraints AX <= a
+    A_ub = np.hstack((A, -np.ones((n, 1))))
+    b_ub = np.zeros(n)
+
+    # Equality constraint: sum of X = 1
+    A_eq = np.ones((1, n+1))
+    A_eq[0, -1] = 0  # No constraint on the last variable a
+    b_eq = np.array([1])
+
+    # Variable bounds: 0 <= x_i <= 1 for all i, 0 <= a
+    bounds = [(0, 1)] * n + [(0, None)]
+
+    # Solve the linear programming problem
+    result = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method=method)
     
-    n = len(G)
-    adj_matrix = np.zeros((n, n))
+    if result.success:
+        # If a solution exists, normalize the X vector using the optimized variable a
+        a_min = result.x[-1]
+        X = result.x[:-1] / a_min
+        return X
+    else:
+        raise ValueError("unable to solve")
+
+
+
+
+def equilibrium_measure(F, L):
+    # Calculate the Equilibrium measure for the given set F
+    # L is the Graph Laplacian matrix, and F is a list.
+    # The entire node set V consists of n elements,
+    # where F consists of r (< n) elements.
+    # The result is a vector of length r, where all elements except those corresponding to F are 0 (the support of EM is F).
+    A = L[F][:, F]
+    # P_measure: probability measure
+    EM_tem = linear_programming(A)
+    result = np.zeros(len(L))
+    result[F] = EM_tem
+    return result
+
+
+
+
+def add_node(F, node):
+    # Add a node to the given list-based set F, maintaining the correct order
+    # Since node is an integer, it carries information about its position
+    # Find the position where the node should be inserted
+    position = np.searchsorted(np.array(F), node)
+    return list(np.insert(np.array(F), position, node))
+
+
+
+def encode_integer(i, classes):
+    # For example, if node 3 belongs to label 1 (out of 3 labels), return [3, 1, 0, 0]
+    # For example, if node 60 belongs to label 2 (out of 5 labels), return [60, 0, 1, 0, 0, 0]
     
-    for edge in G.edges():
-        u, v = edge
-        adj_matrix[u][v] = 1
-        if not G.is_directed():
-            adj_matrix[v][u] = 1
-            
-    return adj_matrix
+    # Initialize the result array
+    # encoded = np.zeros(6, dtype=int)
+    encoded = np.full(len(classes) + 1, 0, dtype=float)
+
+    encoded[0] = i  # The first element is the integer itself
+
+    # Iterate through each sublist in classes to check if it contains i
+    for index, class_list in enumerate(classes):
+        if i in class_list:
+            encoded[index + 1] = 1  # Set 1 at the position corresponding to the class
+            break  # Exit the loop since i has been found
+
+    return encoded
+
+
+
+def known_sets(classes, BP):
+    n_L = len(classes)
+    return [np.random.choice(list(classes[i]), size=math.ceil(len(classes[i])*BP), replace=False) for i in range(n_L)]
+
+
+
+def initialization(G, classes, simplices, BP):
     
-def Initialization(G, Classes, BP):
-       
-    n_classes = len(Classes)
+    # n is |V|=N, and Sets[i] is the set of nodes that are already known to belong to the i-th class.
+    # Nodes should be integers like [0,1,..,N-1]!
+    # A, B, C are composed as lists    
+    n_L = len(classes)
     V = list(G.nodes())
-    adj_matrix = Adjacency_matrix(G)
-    n_classes = len(Classes)
-    
-    # prior known nodes
-    Sets = [np.random.choice(Classes[i], size = math.ceil(len(Classes[i])*BP), replace=False) 
-            for i in range(n_classes)]
-    
-    N = len(adj_matrix)
+    n_V = len(V)
+    adj_matrix = adjacency_matrix(G)
+
+    # Extract known nodes randomly
+    Sets = known_sets(classes, BP)
     degree_matrix = np.diag(np.sum(adj_matrix, axis=1))
-    
-    # Laplacian_matrix
+    # Laplacian matrix
     L = degree_matrix - adj_matrix
-    
-    Boundary_union = set()
-    for Set in Sets:
-        Boundary_union = Boundary_union.union(set(Set))
+
+    # Set of known nodes
+    Boundary_union = {element for subset in Sets for element in subset}
+    # List of unknown nodes
     F = list(np.sort(list(set(V) - Boundary_union)))
 
-    def LP(A):
-        
-        # A is a part of L
-        # L : F x F matrix, hence A: F x F matrix
-        n = A.shape[0]
-
-        c = np.zeros(n+1)
-        c[-1] = 1
-
-        # constraint AX <= a
-        A_ub = np.hstack((A, -np.ones((n, 1))))
-
-        # upper bound
-        b_ub = np.zeros(n)
-
-        # x1 + x2 + ... + xn = 1
-        A_eq = np.zeros((1, n+1))
-        A_eq[0, :n] = 1
-
-        # b_eq = 1
-        b_eq = np.array([1])
-
-        # 0 <= x1, x2, ..., xn <= 1 및 0 <= a (non-negative)
-        bounds = [(0, 1) for _ in range(n)] + [(0, None)]
-
-        # linear programming
-        result = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
-
-        if result.success:
-            X = result.x[:-1]
-            a_min = result.x[-1]
-            return X / a_min
-        else:
-            raise ValueError("Problem occurs")    
-
-    def EM(F, L):
-        # Equilibrium measure of F
-        # |V| = n
-        # |F| = r < n
-        # Remark that the support of EM is F
-        A = L[F][:, F]
-        
-        # P_measure: probability measure
-        EM_tem = LP(A)
-        
-        def Complement(vec):
-
-            result = np.zeros(len(L))
-            for i, value in enumerate(F):
-                result[value] = vec[i]
-            return result
-        
-        return Complement(EM_tem)   
-
-    def Add_node(F, node):
-
-        position = np.searchsorted(np.array(F), node)
-        return list(np.insert(np.array(F), position, node))
+    # Compute v^F
+    v_F = equilibrium_measure(F, L)
     
-    v_F = EM(F, L)
-    
+    # Iterate over each set in Sets
+    ###############################################
+    # This section is time-consuming
     Prob = []
     for k in range(len(Sets)):       
         
@@ -159,195 +324,154 @@ def Initialization(G, Classes, BP):
         Set = Sets[k]
         for i in range(len(Sets[k])):
             s_i = Set[i]
-            F_U_s_i = Add_node(F, Set[i])
-            v_F_U_x.append(EM(F_U_s_i, L))
+            F_U_s_i = add_node(F, Set[i])
+            v_F_U_x.append(equilibrium_measure(F_U_s_i, L))
          
-        Prob.append(sum([ (v_F_U_x[i] - v_F)/v_F_U_x[i][Set[i]] for i in range(len(Set)) ]))
+        Prob.append(sum([(v_F_U_x[i] - v_F)/v_F_U_x[i][Set[i]] for i in range(len(Set))]))
+    ###############################################
     
-    # n_V x n_classes matrix, each row sum is 1
-    probability_matrix = np.stack(Prob).T 
-    initial_data = probability_matrix.flatten()
-    classification_result = np.array([ np.argmax(probability_matrix[i]) 
-                                      for i in range(len(probability_matrix)) ])
-    # Known information
-    Known = []
-    for i in range(len(Sets)):
-        Known = Known + list(Sets[i])
-    Known = list(np.sort(Known))
-    x_known_indices = []
-    for i in range(len(Known)):
-        x_known_indices = x_known_indices + [ n_classes*Known[i] + k for k in range(n_classes) ]
+    probability_matrix = np.stack(Prob).T  # n_V x n_L matrix, each row sum is 1
+    classification_result = np.array([np.argmax(probability_matrix[i]) 
+                                      for i in range(len(probability_matrix))])
+    # Sorted list of known nodes
+    known = sorted(Boundary_union)
+    x_known = np.array([encode_integer(i, classes) for i in known])
     
-    x_known_values = [ initial_data[x_known_indices[i]] for i in range(len(x_known_indices)) ]
-    x_known = np.stack([x_known_indices, x_known_values]).T
-    
-    return initial_data.reshape(-1, n_classes), classification_result, x_known 
+    return probability_matrix, classification_result, x_known
 
-def Multiply(vec):
-    ans = 1
-    for n in vec:
-        if n == 0:
-            return 0
-        ans *= n
-    return ans
 
-# Fac(5) = 5*4*3*2*1, factorial function
-def Fac(integer):
-    return np.prod(np.arange(1,integer+1))
 
-def Basis_mat(Simplices, n_classes):
-    HS = len(Simplices[-1][0])
-    basis = [np.eye(n_classes)[i].reshape(-1,1) for i in range(n_classes)]
-    mat = [ basis ] +  [ [] for i in range(HS-1) ]
-    for k in range(HS-1):
+
+
+def fac(integer):
+    # Calculate factorial. No special GPU operations are needed when using PyTorch.
+    return torch.tensor([math.factorial(integer)], dtype=torch.float32)
+
+
+
+
+
+def basis_mat(n_max, n_classes):
+    basis = [torch.eye(n_classes)[i].unsqueeze(-1) for i in range(n_classes)]
+    mat = [basis] + [[] for _ in range(n_max - 1)]
+    for k in range(n_max - 1):
         for j in range(n_classes):
-            for i in range(n_classes**(k+1)):
-                mat[k+1].append(np.concatenate([basis[j], mat[k][i]], axis=1)) 
-    return mat, HS
+            for i in range(n_classes ** (k + 1)):
+                mat[k + 1].append(torch.cat([basis[j], mat[k][i]], dim=1))
+    return mat
 
-# x is the variable of function
-# HOI = 0 means the algorithm only use pairwise interactions between nodes
-# HOI = 1 means the algorithm use higher order interaction as well as pairwise interactions
-def Objective(x, x_known, Simplices, n_classes, HOI, exp_factor):
+
+
+
+def prob_product(vectors):
+    result = vectors[0]
+    for vector in vectors[1:]:
+        result = torch.ger(result, vector).flatten()
+    return result
+
+
+
+
+def generalized_outer_product(P, index_lists):
+    results = []
+    for indices in index_lists:
+        selected_vectors = [P[idx] for idx in indices]
+        result = prob_product(selected_vectors)
+        results.append(result)
+    result_matrix = torch.stack(results)
+    return result_matrix
+
+
+
+
+def objective(P, simplices, n_L, exp_base, device):
+    n_max = len(simplices)
     
-    if HOI == 0:
-        X = x.copy()
-        for i in range(len(x_known)):
-            X = np.insert(X,int(x_known[i][0]),x_known[i][1])
-        basis = [np.eye(n_classes)[i] for i in range(n_classes)]
-        mat = []
-        for i in range(n_classes):
-            for j in range(n_classes):
-                tem = np.stack([basis[i], basis[j]]).T
-                mat.append(tem)      
-        simplex = np.array(Simplices[1])
-        coef = np.array([ Fac(2) / np.prod([Fac(mat[j].sum(1)[i]) for i in range(n_classes)]) 
-                         for j in range(len(mat))])
-        #coef_sum = coef.sum()
-        error = []
-        for i in range(len(simplex)):
-            # In this case, nodes is of the form [a,b], hence len(nodes) = 2
-            nodes = simplex[i]
-            P_tem = [ [X[n_classes * nodes[j] + t] for j in range(len(nodes))] for t in range(n_classes) ]
-            prob_mat = np.stack(P_tem)
-            prob = np.array([Multiply((prob_mat*mat[j]).sum(0)) for j in range(len(mat))])
-            total_prob = (prob * coef).sum()
-            error.append(total_prob)
+    prob_prod_set = [generalized_outer_product(P, simplices[i]) for i in range(n_max)]
+    mat = basis_mat(n_max, n_L)  
+    coef = [torch.tensor([fac(k+1) / torch.prod(torch.tensor([fac(int(mat[k][j].sum(1)[i])) for i in range(n_L)]))
+                            for j in range(len(mat[k]))], device=device)
+                            for k in range(n_max)]
+    clique_weight = torch.tensor([exp_base ** i for i in range(n_max)], device=device)  
+    multi_coef_applied_prob = sum([clique_weight[i] * (coef[i] * prob_prod_set[i]).sum() for i in range(1, n_max)])
+    return multi_coef_applied_prob
 
-        ERROR = np.array(error).sum()
+
+
+
+class Model(nn.Module):
+    def __init__(self, device, initial_data, x_known, exp_base):
+        super(Model, self).__init__()
+        self.device = device
+        self.exp_base = exp_base
+
+        # Ensure initial_data is a torch.Tensor and move it to the correct device
+        if not isinstance(initial_data, torch.Tensor):
+            initial_data = torch.tensor(initial_data, dtype=torch.float32, device=device)
+        else:
+            initial_data = initial_data.to(device)
+
+        self.n_V, self.n_L = initial_data.shape
         
-    if HOI == 1:
-        X = x.copy()
-        for i in range(len(x_known)):
-            X = np.insert(X,int(x_known[i][0]),x_known[i][1])
-
-        mat, HS = Basis_mat(Simplices, n_classes)
-        total_error = []
-        total_coef_sum = []
-        len_simplex = []
-        for k in range(1, HS):
-            simplex = np.array(Simplices[k]).astype(int)
-            len_simplex.append(len(simplex))
-            coef = np.array([ Fac(k+1) / np.prod([Fac(mat[k][j].sum(1)[i]) for i in range(n_classes)])
-                              for j in range(len(mat[k]))])
-            coef_sum = coef.sum()
-            total_coef_sum.append(coef_sum)
-            error = []
-            for i in range(len(simplex)):
-                nodes = simplex[i]
-                P_tem = [ [X[n_classes * nodes[j] + t] for j in range(len(nodes))] for t in range(n_classes) ]
-                prob_mat = np.stack(P_tem)
-                prob = np.array([Multiply((prob_mat*mat[k][j]).sum(0)) for j in range(len(mat[k]))])
-                total_prob = (prob * coef).sum()
-                error.append(total_prob)    
-            total_error.append(sum(error)) 
-   
-        new_error = np.array(total_error) / np.array(total_coef_sum) / np.array(len_simplex)
-        weight1 = 1**(np.arange(1,HS)-1)
-        ERROR = ( weight1 * np.array(new_error) ).sum() 
+        # Extract indices from x_known
+        self.fixed_indices = x_known[:, 0].astype(int)
+        fixed_values = torch.tensor(x_known[:, 1:], dtype=torch.float32, device=device)
         
-    return ERROR
+        # Store the non-trainable part as a regular tensor
+        self.fixed_params = fixed_values
+        
+        # Set up the trainable parameters
+        mask = torch.ones(self.n_V, dtype=torch.bool, device=device)
+        mask[self.fixed_indices] = False
+        self.trainable_params = nn.Parameter(initial_data[mask])
 
-def Optimization(x_init, x_known, Simplices, n_classes, HOI, exp_factor):
-    n_V = len(Simplices[0])
+    def forward(self, simplices):
+        # Restore the full data
+        full_data = torch.empty((self.n_V, self.n_L), device=self.device)
+        full_data[self.fixed_indices] = self.fixed_params
+        mask = torch.ones(self.n_V, dtype=torch.bool, device=self.device)
+        mask[self.fixed_indices] = False
+        all_indices = torch.arange(self.n_V, device=self.device)
+        trainable_indices = all_indices[mask]
+        full_data[trainable_indices] = self.trainable_params
+        
+        # Apply Softmax (example applying to the entire data)
+        soft_P = F.softmax(full_data, dim=1)
+        
+        return objective(soft_P, simplices, self.n_L, self.exp_base, self.device)
 
-    # constraints
-    constraints = []
-    for i in range(n_V-int(len(x_known)/n_classes)):
-        con = {"type": "eq", "fun": lambda x, i=i: sum([x[n_classes*i + k] for k in range(n_classes)]) - 1}
-        constraints.append(con)
-    bounds = [(0, 1)] * (n_classes * n_V - len(x_known))
 
-    # optimization
-    result = minimize(lambda x: Objective(x, x_known, Simplices, n_classes, HOI, exp_factor), 
-                      x_init, bounds=bounds, constraints=constraints, method='SLSQP')
-    x_val1 = result.x
-    x_val2 = x_val1.copy()
-    for i in range(len(x_known)):
-        x_val2 = np.insert(x_val2,int(x_known[i][0]),x_known[i][1])
-    result_mat = x_val2.reshape(-1,n_classes)
-    prediction = np.array([np.argmax(result_mat[i]) for i in range(n_V)])
-    return result_mat, prediction
 
-def confusion_matrix(labels, predictions, n_classes):
-    matrix = np.zeros((n_classes, n_classes), dtype=np.int64)
 
-    for true_label, pred_label in zip(labels, predictions):
-        matrix[true_label][pred_label] += 1
+def training(epochs, device, simplices, initial_data, x_known, lr, exp_base):
+    model = Model(device, initial_data, x_known, exp_base).to(device)
+    optimizer = optim.Adam([model.trainable_params], lr=lr)
 
-    return matrix
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+        loss = model(simplices)
+        loss.backward()
+        optimizer.step()
 
-def precision_recall_f1_accuracy(conf_matrix):
-    num_classes = conf_matrix.shape[0]
-    true_positives = np.diag(conf_matrix)
-    false_positives = np.sum(conf_matrix, axis=0) - true_positives
-    false_negatives = np.sum(conf_matrix, axis=1) - true_positives
+        if epoch % (epochs // 5) == 0:
+            print(f'Epoch {epoch + 1}, Loss: {loss.item()}')
+
+    # Data restoration process
+    final_data = torch.empty((model.n_V, model.n_L), device=device)
+    final_data[model.fixed_indices] = model.fixed_params
+    mask = torch.ones(model.n_V, dtype=torch.bool, device=device)
+    mask[model.fixed_indices] = False
+    all_indices = torch.arange(model.n_V, device=device)
+    trainable_indices = all_indices[mask]
+    final_data[trainable_indices] = model.trainable_params.detach()
     
-    precision = true_positives / (true_positives + false_positives)
-    recall = true_positives / (true_positives + false_negatives)
-    f1_score = 2 * (precision * recall) / (precision + recall)
+    # Apply Softmax only to trainable indices
+    softmax_data = torch.empty_like(final_data)  # Create an empty tensor with the same shape as final_data
+    softmax_data[model.fixed_indices] = final_data[model.fixed_indices]  # Copy the fixed part as is
+    softmax_data[trainable_indices] = F.softmax(final_data[trainable_indices], dim=1)  # Apply softmax only to the trainable part
     
-    accuracy = np.sum(true_positives) / np.sum(conf_matrix)
-    
-    precision = list(precision)
-    recall = list(recall)
-    f1_score = list(f1_score)
-    accuracy = [ accuracy ]
-    return precision, recall, f1_score, accuracy
+    final_P = softmax_data.cpu().numpy()  # Convert the tensor to a NumPy array
+    pred = np.argmax(final_P, axis=1)
+    return final_P, pred
 
-def Reconstruction(G):
-    V = [ i for i in range(len(G)) ]
-    n_V = len(V)
-    label_set = sorted(list(set([G.nodes[node]['value'] for node in G.nodes])))
-    n_classes = len(label_set)
-    # make labels to 0,1,2,...
-    for node in G.nodes:
-        for i in range(n_classes):
-            if G.nodes[node]['value'] == label_set[i]:
-                G.nodes[node]['value'] = i
-
-    # name nodes to 0,1,2,..,len(node)          
-    next_node_id = 0
-    mapping = {}            
-    for i in range(n_classes):
-        for node in G.nodes:
-            if G.nodes[node]['value'] == i:
-                mapping[node] = next_node_id
-                next_node_id += 1
-    G = nx.relabel_nodes(G, mapping)   
-    Classes = [ [node for node in G.nodes if G.nodes[node]['value'] == i] for i in range(n_classes) ]
-    n_counts = [ len(Classes[i]) for i in range(n_classes) ]
-
-    # Simplices
-    all_cliques = list(nx.enumerate_all_cliques(G))
-    Simplices = [ [] for i in range(len(all_cliques[-1])) ]
-    for i in range(len(all_cliques)):
-        n = len(all_cliques[i])
-        Simplices[n-1].append(all_cliques[i])
-    Label = []
-    for i in range(n_classes):
-        Label = Label + [i for k in range(n_counts[i])]
-    Label_mat = np.concatenate([np.stack([np.eye(n_classes)[i] for j in range(n_counts[i])]) 
-                                for i in range(n_classes)]) 
-    return G, Simplices, Classes, Label, Label_mat
 
