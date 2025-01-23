@@ -385,15 +385,28 @@ def generalized_outer_product(P, index_lists):
 
 
 def objective(P, simplices, n_L, exp_base, device):
+    """
+    P: shape = [n_V, n_L] # probability distribution for each node
+    """
     n_max = len(simplices)
-    
     prob_prod_set = [generalized_outer_product(P, simplices[i]) for i in range(n_max)]
-    mat = basis_mat(n_max, n_L)  
-    coef = [torch.tensor([fac(k+1) / torch.prod(torch.tensor([fac(int(mat[k][j].sum(1)[i])) for i in range(n_L)]))
-                            for j in range(len(mat[k]))], device=device)
-                            for k in range(n_max)]
-    clique_weight = torch.tensor([exp_base ** i for i in range(n_max)], device=device)  
+    mat = basis_mat(n_max, n_L)   
+    
+    coef = [0]
+    for k in range(1, n_max):
+        cvals = []
+        for j in range(len(mat[k])): 
+            
+            row_sums = mat[k][j].sum(1)
+            row_fac = torch.prod(torch.tensor([fac(int(row_sums[i])) for i in range(n_L)]))
+            cvals.append(fac(k) / row_fac)
+        coef.append(torch.tensor(cvals, device=device))
+    
+    
+    clique_weight = torch.tensor([exp_base ** i for i in range(n_max)], device=device)
+    
     multi_coef_applied_prob = sum([clique_weight[i] * (coef[i] * prob_prod_set[i]).sum() for i in range(1, n_max)])
+    
     return multi_coef_applied_prob
 
 
