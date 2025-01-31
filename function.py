@@ -155,9 +155,11 @@ def k_cliques_generation(N, k, prob_mat):
 
 # Converts the generated higher-dimensional structures (cliques) into edges to add them to the graph.
 def to_edges(cliques):
-    result_list = []
+    result_set = set()
     for clique in cliques:
-        combinations = list(itertools.combinations(clique, 2))
+        combinations = itertools.combinations(clique, 2)
+        result_set.update(combinations)
+    return list(result_set)
 
 
 
